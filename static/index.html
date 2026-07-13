@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bridge Console</title>
+<style>
+  :root {
+    --bg: #0a0d12;
+    --panel: #12161d;
+    --panel-edge: #1e242e;
+    --text: #e6ebef;
+    --muted: #6b7684;
+    --live: #ff8a3d;
+    --live-dim: #4a3320;
+    --standby: #3a4250;
+    --select-accent: #46d3c6;
+    --danger: #e6555a;
+    --mono: "SF Mono", "IBM Plex Mono", "Consolas", ui-monospace, monospace;
+    --sans: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+  }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px 16px;
+    background-image:
+      radial-gradient(circle at 15% 8%, rgba(70, 211, 198, 0.05), transparent 40%),
+      radial-gradient(circle at 85% 92%, rgba(255, 138, 61, 0.05), transparent 40%);
+  }
+
+  .console {
+    width: 100%;
+    max-width: 480px;
+    background: var(--panel);
+    border: 1px solid var(--panel-edge);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+
+  .console-header {
+    padding: 20px 24px;
+    border-bottom: 1px solid var(--panel-edge);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .brand {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+
+  .status-pill {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 5px 10px 5px 8px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--panel-edge);
+  }
+
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--standby);
+    flex-shrink: 0;
+  }
+
+  .status-pill.on-air .dot {
+    background: var(--live);
+    box-shadow: 0 0 0 0 rgba(255, 138, 61, 0.6);
+    animation: pulse 2s infinite;
+  }
+
+  .status-pill.on-air { color: var(--live); border-color: var(--live-dim); }
+
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(255, 138, 61, 0.5); }
+    70%  { box-shadow: 0 0 0 7px rgba(255, 138, 61, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(255, 138, 61, 0); }
+  }
+
+  .body-area { padding: 24px; }
+
+  .now-playing {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    margin: 0 0 22px;
+    line-height: 1.5;
+    min-height: 18px;
+  }
+
+  .now-playing.idle { font-style: italic; }
+
+  .field {
+    margin-bottom: 20px;
+  }
+
+  .field:last-child { margin-bottom: 0; }
+
+  .field-label {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+
+  .field-label span.tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .field-label span.current {
+    font-size: 11px;
+    color: var(--select-accent);
+    font-family: var(--mono);
+  }
+
+  select {
+    width: 100%;
+    appearance: none;
+    -webkit-appearance: none;
+    background: #0d1117;
+    border: 1px solid var(--panel-edge);
+    color: var(--text);
+    font-size: 14px;
+    font-family: var(--sans);
+    padding: 11px 36px 11px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b7684'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    transition: border-color 0.15s ease;
+  }
+
+  select:hover:not(:disabled) { border-color: var(--select-accent); }
+  select:focus-visible { outline: 2px solid var(--select-accent); outline-offset: 1px; }
+  select:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .footer-note {
+    margin-top: 22px;
+    font-size: 11px;
+    color: var(--muted);
+    font-family: var(--mono);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 14px;
+  }
+
+  .footer-note.busy::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--select-accent);
+    animation: blink 0.9s infinite;
+  }
+
+  @keyframes blink { 50% { opacity: 0.2; } }
+
+  .footer-note.error { color: var(--danger); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .status-pill.on-air .dot { animation: none; }
+    .footer-note.busy::before { animation: none; }
+  }
+</style>
+</head>
+<body>
+
+  <div class="console">
+    <div class="console-header">
+      <div class="brand">Jellyfin &rarr; VRChat Bridge</div>
+      <div class="status-pill" id="statusPill">
+        <span class="dot"></span>
+        <span id="statusText">Standby</span>
+      </div>
+    </div>
+
+    <div class="body-area">
+      <p class="now-playing idle" id="nowPlaying">Nothing is currently casting.</p>
+
+      <div class="field">
+        <div class="field-label">
+          <span class="tag">Audio Track</span>
+          <span class="current" id="audioCurrent"></span>
+        </div>
+        <select id="audioSelect" disabled>
+          <option value="">No audio tracks available</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <div class="field-label">
+          <span class="tag">Subtitles</span>
+          <span class="current" id="subtitleCurrent"></span>
+        </div>
+        <select id="subtitleSelect" disabled>
+          <option value="">No subtitle tracks available</option>
+        </select>
+      </div>
+
+      <div class="footer-note" id="footerNote"></div>
+    </div>
+  </div>
+
+<script>
+(function () {
+  const NO_SUBTITLE = "none";
+  const POLL_INTERVAL_MS = 4000;
+
+  const statusPill = document.getElementById("statusPill");
+  const statusText = document.getElementById("statusText");
+  const nowPlaying = document.getElementById("nowPlaying");
+  const audioSelect = document.getElementById("audioSelect");
+  const subtitleSelect = document.getElementById("subtitleSelect");
+  const audioCurrent = document.getElementById("audioCurrent");
+  const subtitleCurrent = document.getElementById("subtitleCurrent");
+  const footerNote = document.getElementById("footerNote");
+
+  let lastItemId = null;
+  let applying = false;
+
+  function setFooter(message, mode) {
+    footerNote.textContent = message || "";
+    footerNote.className = "footer-note" + (mode ? " " + mode : "");
+  }
+
+  function trackLabel(track) {
+    const lang = track.language ? track.language.toUpperCase() : "UND";
+    return `${track.display_title} \u00b7 ${lang}`;
+  }
+
+  function populateSelect(select, tracks, selectedValue, placeholder) {
+    select.innerHTML = "";
+    if (!tracks.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = placeholder;
+      select.appendChild(opt);
+      select.disabled = true;
+      return;
+    }
+    tracks.forEach((track) => {
+      const opt = document.createElement("option");
+      opt.value = track.value;
+      opt.textContent = trackLabel(track);
+      select.appendChild(opt);
+    });
+    if (selectedValue && tracks.some((t) => t.value === selectedValue)) {
+      select.value = selectedValue;
+    }
+    select.disabled = applying;
+  }
+
+  function findCurrentLabel(tracks, currentIndex) {
+    const match = tracks.find((t) => t.index === currentIndex);
+    return match ? trackLabel(match) : "";
+  }
+
+  async function refresh() {
+    let data;
+    try {
+      const res = await fetch("/api/tracks");
+      data = await res.json();
+    } catch (err) {
+      setFooter("Can't reach the bridge.", "error");
+      return;
+    }
+
+    if (!data.active) {
+      statusPill.classList.remove("on-air");
+      statusText.textContent = "Standby";
+      nowPlaying.textContent = "Nothing is currently casting.";
+      nowPlaying.classList.add("idle");
+      audioCurrent.textContent = "";
+      subtitleCurrent.textContent = "";
+      populateSelect(audioSelect, [], null, "Nothing playing");
+      populateSelect(subtitleSelect, [], null, "Nothing playing");
+      lastItemId = null;
+      if (!applying) setFooter("", null);
+      return;
+    }
+
+    statusPill.classList.add("on-air");
+    statusText.textContent = "On Air";
+    nowPlaying.classList.remove("idle");
+    nowPlaying.textContent = "Casting to VRChat.";
+
+    // Only rebuild the dropdown options when the playing item actually
+    // changes, so we don't fight the user mid-selection on every poll.
+    if (data.item_id !== lastItemId) {
+      populateSelect(audioSelect, data.audio_tracks, data.selected_audio_language, "No audio tracks available");
+      const subtitleOptions = [
+        { value: NO_SUBTITLE, display_title: "Off", language: "", index: -1 },
+        ...data.subtitle_tracks,
+      ];
+      populateSelect(subtitleSelect, subtitleOptions, data.selected_subtitle_language || NO_SUBTITLE, "No subtitle tracks available");
+      lastItemId = data.item_id;
+    }
+
+    audioCurrent.textContent = findCurrentLabel(data.audio_tracks, data.current_audio_index);
+    subtitleCurrent.textContent = data.current_subtitle_index === null
+      ? "Off"
+      : findCurrentLabel(data.subtitle_tracks, data.current_subtitle_index);
+
+    if (!applying) setFooter("", null);
+  }
+
+  async function applySelection() {
+    applying = true;
+    audioSelect.disabled = true;
+    subtitleSelect.disabled = true;
+    setFooter("Applying selection\u2026", "busy");
+
+    const payload = {
+      audio_language: audioSelect.value || null,
+      subtitle_language: subtitleSelect.value || null,
+    };
+
+    try {
+      const res = await fetch("/api/tracks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        setFooter(text || "Couldn't apply selection.", "error");
+      } else {
+        setFooter("Applied.", null);
+      }
+    } catch (err) {
+      setFooter("Couldn't reach the bridge.", "error");
+    } finally {
+      applying = false;
+      audioSelect.disabled = false;
+      subtitleSelect.disabled = false;
+      await refresh();
+    }
+  }
+
+  audioSelect.addEventListener("change", applySelection);
+  subtitleSelect.addEventListener("change", applySelection);
+
+  refresh();
+  setInterval(() => { if (!applying) refresh(); }, POLL_INTERVAL_MS);
+})();
+</script>
+
+</body>
+</html>
