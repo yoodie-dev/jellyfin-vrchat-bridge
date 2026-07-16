@@ -25,6 +25,8 @@ DEVICE_NAME = os.environ.get("DEVICE_NAME", "VRChat Stream Target")
 CLIENT_NAME = os.environ.get("CLIENT_NAME", "VRChat HLS Bridge")
 JELLYFIN_USERNAME = os.environ.get("JELLYFIN_USERNAME", "user")
 JELLYFIN_PASSWORD = os.environ.get("JELLYFIN_PASSWORD", "password")
+BRIDGE_LOG_LEVEL = os.environ.get("BRIDGE_LOG_LEVEL", "INFO").upper()
+OTHER_LOG_LEVEL = os.environ.get("OTHER_LOG_LEVEL", "WARNING").upper()
 VERSION = "1.0.0"
 
 # Directory holding the web UI's static assets (index.html, etc).
@@ -41,8 +43,10 @@ JELLYFIN_HEADERS = {
 }
 
 # --- GLOBALS & STATE ---
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=getattr(logging, BRIDGE_LOG_LEVEL))
 logger = logging.getLogger("JellyfinVRChatBridge")
+logging.getLogger("httpx").setLevel(getattr(logging, OTHER_LOG_LEVEL))  # Silence httpx debug logs unless requested
+logging.getLogger("websockets").setLevel(getattr(logging, OTHER_LOG_LEVEL))  # Silence websockets debug logs unless requested
 
 app = FastAPI()
 
@@ -72,11 +76,7 @@ current_subtitle_stream_index: Optional[int] = None
 current_audio_streams: list = []
 current_subtitle_streams: list = []
 
-# --- SHARED PLAYBACK POSITION TRACKING ---
-# These let us figure out "how far into the video is everyone else" so that a
-# client connecting to /stream.m3u8 later than others gets a playlist that
-# starts near the current position instead of at 0:00 - i.e. joining a shared
-# broadcast rather than starting their own personal copy from the beginning.
+#--- PLAYBACK CLOCK STATE ---
 playback_started_at = None   # time.monotonic() when the current item started playing
 paused_at = None             # time.monotonic() when we most recently paused, if paused now
 total_paused_seconds = 0.0   # cumulative time spent paused for the current item
@@ -133,9 +133,7 @@ DEVICE_PROFILE = {
         }
     ],
     # Force Jellyfin to burn subtitles directly into the video frames
-    # -- IF a subtitle stream is actually selected below. Declaring these
-    # profiles only controls HOW a chosen subtitle gets rendered; it does
-    # not choose one. That's why subtitles weren't showing up at all.
+    # as most VRChat video players don't support external subtitle tracks.
     "SubtitleProfiles": [
         {"Format": "srt", "Method": "Encode"},
         {"Format": "vtt", "Method": "Encode"},
@@ -579,27 +577,27 @@ async def jellyfin_websocket_listener():
                                 stream_playing_event.clear()
                                 if paused_at is None:
                                     paused_at = time.monotonic()
-                                logger.info("Phone requested PAUSE.")
+                                logger.info("Server requested PAUSE.")
                             elif command == "Unpause":
                                 stream_playing_event.set()
                                 if paused_at is not None:
                                     total_paused_seconds += time.monotonic() - paused_at
                                     paused_at = None
-                                logger.info("Phone requested PLAY.")
+                                logger.info("Server requested PLAY.")
                             elif command == "PlayPause":
                                 if stream_playing_event.is_set():
                                     stream_playing_event.clear()
                                     if paused_at is None:
                                         paused_at = time.monotonic()
-                                    logger.info("Phone toggled PlayPause -> PAUSE.")
+                                    logger.info("Server toggled PlayPause -> PAUSE.")
                                 else:
                                     stream_playing_event.set()
                                     if paused_at is not None:
                                         total_paused_seconds += time.monotonic() - paused_at
                                         paused_at = None
-                                    logger.info("Phone toggled PlayPause -> PLAY.")
+                                    logger.info("Server toggled PlayPause -> PLAY.")
                             elif command == "Stop":
-                                logger.info("Phone requested STOP. Clearing active stream.")
+                                logger.info("Server requested STOP. Clearing active stream.")
                                 # Tell Jellyfin playback actually ended - without this
                                 # call, Jellyfin has no idea we stopped and leaves the
                                 # transcode running indefinitely.
@@ -748,9 +746,9 @@ async def proxy_segment(request: Request, url: str = Query(...), filename: str =
     
     # 1. Pause logic
     if not stream_playing_event.is_set():
-        logger.info("Player requested chunk, but phone is paused. Holding request open...")
+        logger.info("Player requested chunk, but server is paused. Holding request open...")
         await stream_playing_event.wait()
-        logger.info("Phone unpaused! Releasing held chunk request.")
+        logger.info("Server unpaused! Releasing held chunk request.")
 
     # 2. If it's a playlist (.m3u8), intercept and rewrite it.
     # Determine this from the URL's path/extension only, NOT from substrings
