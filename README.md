@@ -88,6 +88,10 @@ Play/Pause should be done through the VRChat video player so VRChat can handle k
 | `CLIENT_NAME` | Client name reported to Jellyfin | `VRChat HLS Bridge` |
 | `BRIDGE_LOG_LEVEL` | Log level for the bridge's own logger | `INFO` |
 | `OTHER_LOG_LEVEL` | Log level for third-party library loggers (`httpx`, `websockets`) | `WARNING` |
+| `DEFAULT_AUDIO_LANGUAGE` | Audio language code (e.g. `eng`) auto-selected for non-anime items. Leave unset for auto (Jellyfin's default track) | *(auto)* |
+| `DEFAULT_SUBTITLE_LANGUAGE` | Subtitle language code auto-selected for non-anime items. Set to `none` to force subtitles off by default, or leave unset for auto | *(auto)* |
+| `ANIME_AUDIO_LANGUAGE` | Audio language code auto-selected for items tagged `anime` in Jellyfin (tag goes on the Series, not each episode). Set to an empty string for auto instead - note this does *not* fall back to `DEFAULT_AUDIO_LANGUAGE`, the two are independent | `jpn` |
+| `ANIME_SUBTITLE_LANGUAGE` | Subtitle language code auto-selected for items tagged `anime`. Set to `none` to force off, or an empty string for auto (independent of `DEFAULT_SUBTITLE_LANGUAGE`, same caveat as above) | `eng` |
 
 ## AI Disclaimer
 
