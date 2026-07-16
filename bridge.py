@@ -16,6 +16,20 @@ from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env file if present
 
+
+def _env_language(name: str, default: Optional[str] = None) -> Optional[str]:
+    """Reads a language-preference env var. Unset falls back to `default`;
+    set-but-empty ("") explicitly means "auto" (None), so anime defaults can
+    be turned off via an empty override without touching code. Lowercased so
+    it lines up with the "none" sentinel (NO_SUBTITLE) and the language-code
+    comparisons in _language_matches, regardless of casing in the .env file.
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() or None
+
+
 # --- CONFIGURATION ---
 # Read from environment variables, with fallback defaults
 JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://jellyfin:8096")
@@ -33,14 +47,25 @@ VERSION = "1.0.0"
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 # Sentinel used in the audio/subtitle selection API to mean "explicitly no
-# subtitles", as distinct from `None` which means "auto-pick" (the original
-# English -> default -> first-available logic below).
+# subtitles", as distinct from `None` which means "auto-pick" (default track
+# -> English -> first-available for subtitles; default track -> first-available
+# for audio - see _resolve_audio_stream/_resolve_subtitle_stream below).
 NO_SUBTITLE = "none"
 
-JELLYFIN_HEADERS = {
-    "X-Emby-Authorization": f'MediaBrowser Client="{CLIENT_NAME}", Device="{DEVICE_NAME}", DeviceId="{DEVICE_ID}", Version="{VERSION}"',
-    # We will add the token here automatically later!
-}
+# Jellyfin tag (case-insensitive) that marks a show/movie as anime. Applied on
+# the Series item, not individual Episodes - see is_anime_item below.
+ANIME_TAG = "anime"
+
+# Default audio/subtitle language preferences, applied whenever a new item
+# starts playing (see the "play" handler in jellyfin_websocket_listener).
+# DEFAULT_* apply to everything; ANIME_* override them specifically for items
+# tagged ANIME_TAG. All four accept a language code (e.g. "eng"), NO_SUBTITLE
+# ("none") for the subtitle vars, or are left as None for "auto" (see
+# NO_SUBTITLE above for the fallback order).
+DEFAULT_AUDIO_LANGUAGE = _env_language("DEFAULT_AUDIO_LANGUAGE")
+DEFAULT_SUBTITLE_LANGUAGE = _env_language("DEFAULT_SUBTITLE_LANGUAGE")
+ANIME_AUDIO_LANGUAGE = _env_language("ANIME_AUDIO_LANGUAGE", "jpn")
+ANIME_SUBTITLE_LANGUAGE = _env_language("ANIME_SUBTITLE_LANGUAGE", "eng")
 
 # --- GLOBALS & STATE ---
 logging.basicConfig(level=getattr(logging, BRIDGE_LOG_LEVEL))
@@ -50,6 +75,8 @@ logging.getLogger("websockets").setLevel(getattr(logging, OTHER_LOG_LEVEL))  # S
 
 app = FastAPI()
 
+# The user token gets added to this dict once login succeeds - see
+# jellyfin_websocket_listener, which sets JELLYFIN_HEADERS["X-MediaBrowser-Token"].
 JELLYFIN_HEADERS = {
     "X-Emby-Authorization": f'MediaBrowser Client="{CLIENT_NAME}", Device="{DEVICE_NAME}", DeviceId="{DEVICE_ID}", Version="{VERSION}"',
 }
@@ -59,14 +86,15 @@ current_media_source_id = None
 active_stream_url = None
 stream_playing_event = None  # Initialized as an asyncio.Event() on startup
 
-# --- AUDIO/SUBTITLE LANGUAGE SELECTION (set via the web UI) ---
+# --- AUDIO/SUBTITLE LANGUAGE SELECTION (set via the web UI, or DEFAULT_*/
+# ANIME_*_LANGUAGE env vars whenever a new item starts) ---
 # Preferences are stored as language codes (e.g. "eng", "spa") rather than raw
 # stream indices, since indices aren't stable across different media items.
-# `None` means "auto" (fall back to the original English -> default -> first
-# logic). `preferred_subtitle_language` can also be NO_SUBTITLE to explicitly
-# disable subtitles.
-preferred_audio_language: Optional[str] = None
-preferred_subtitle_language: Optional[str] = None
+# `None` means "auto" (see NO_SUBTITLE above for the fallback order).
+# `preferred_subtitle_language` can also be NO_SUBTITLE to explicitly disable
+# subtitles.
+preferred_audio_language: Optional[str] = DEFAULT_AUDIO_LANGUAGE
+preferred_subtitle_language: Optional[str] = DEFAULT_SUBTITLE_LANGUAGE
 
 # The actual resolved stream indices/track lists for whatever is currently
 # playing, cached here so the web UI can display them without having to
@@ -76,7 +104,7 @@ current_subtitle_stream_index: Optional[int] = None
 current_audio_streams: list = []
 current_subtitle_streams: list = []
 
-#--- PLAYBACK CLOCK STATE ---
+# --- PLAYBACK CLOCK STATE ---
 playback_started_at = None   # time.monotonic() when the current item started playing
 paused_at = None             # time.monotonic() when we most recently paused, if paused now
 total_paused_seconds = 0.0   # cumulative time spent paused for the current item
@@ -174,6 +202,74 @@ async def discover_media_streams(client: httpx.AsyncClient, item_id: str) -> tup
     return audio_streams, subtitle_streams, media_source_id
 
 
+async def _get_item_tags_and_genres(client: httpx.AsyncClient, item_id: str) -> tuple:
+    """Fetches an item's Tags/Genres plus its SeriesId (present on Episodes,
+    None otherwise). Returns (tags, genres, series_id), with tags/genres
+    lowercased for case-insensitive matching."""
+    url = f"{JELLYFIN_URL}/Items/{item_id}"
+    try:
+        res = await client.get(url, params={"Fields": "Tags,Genres"}, headers=JELLYFIN_HEADERS)
+        data = res.json()
+    except Exception as e:
+        logger.error(f"Failed to fetch item metadata for {item_id}: {e}")
+        return [], [], None
+    tags = [t.lower() for t in (data.get("Tags") or [])]
+    genres = [g.lower() for g in (data.get("Genres") or [])]
+    return tags, genres, data.get("SeriesId")
+
+
+async def is_anime_item(client: httpx.AsyncClient, item_id: str) -> bool:
+    """True if this item is tagged "anime" in Jellyfin. Anime is tagged on the
+    Series rather than individual Episodes, so for an Episode item (which has
+    a SeriesId) we also check its parent series' tags."""
+    tags, genres, series_id = await _get_item_tags_and_genres(client, item_id)
+    if ANIME_TAG in tags or ANIME_TAG in genres:
+        return True
+    if series_id:
+        series_tags, series_genres, _ = await _get_item_tags_and_genres(client, series_id)
+        return ANIME_TAG in series_tags or ANIME_TAG in series_genres
+    return False
+
+
+# Jellyfin/ffprobe releases aren't consistent about 2- vs 3-letter language
+# codes (e.g. "ja" vs "jpn"). Preferences we pass ourselves (see is_anime_item
+# usage below) use the 3-letter form, so without this a mismatched rip would
+# silently fail to match and fall through to IsDefault instead - which for
+# dub-first anime releases is often the English dub, i.e. the opposite of
+# what was requested.
+_LANGUAGE_ALIASES = {
+    "eng": {"eng", "en", "english"},
+    "jpn": {"jpn", "ja", "jp", "japanese"},
+}
+
+
+def _language_matches(stream_language: Optional[str], preference: str) -> bool:
+    stream_language = (stream_language or "").lower()
+    preference = preference.lower()
+    if stream_language == preference:
+        return True
+    return stream_language in _LANGUAGE_ALIASES.get(preference, set())
+
+
+def _pick_preferred(candidates: list) -> Optional[dict]:
+    """Given multiple streams that already match on language, prefers a
+    non-forced (i.e. full dialogue, not just a signs/songs snippet) track,
+    then whichever the file flags as default, else just the first.
+
+    This matters because many releases ship a "signs & songs" or "forced"
+    track tagged with the same language as the real full dialogue track,
+    just to caption on-screen text. Without this tie-break, that partial
+    track could win simply by appearing earlier in the stream list -
+    leaving viewers with burned-in subtitles that only appear during a
+    handful of scenes.
+    """
+    if not candidates:
+        return None
+    non_forced = [s for s in candidates if not s.get("IsForced")]
+    pool = non_forced or candidates
+    return next((s for s in pool if s.get("IsDefault")), pool[0])
+
+
 def _match_by_preference(streams: list, preference: Optional[str]) -> Optional[dict]:
     """Matches a stream against a preference string, which is normally a
     language code (e.g. "eng") but can also be "idx:<N>" to target a specific
@@ -188,7 +284,8 @@ def _match_by_preference(streams: list, preference: Optional[str]) -> Optional[d
         except ValueError:
             return None
         return next((s for s in streams if s.get("Index") == target_index), None)
-    return next((s for s in streams if (s.get("Language") or "").lower() == preference.lower()), None)
+    candidates = [s for s in streams if _language_matches(s.get("Language"), preference)]
+    return _pick_preferred(candidates)
 
 
 def _resolve_audio_stream(audio_streams: list, audio_language: Optional[str]) -> Optional[dict]:
@@ -207,15 +304,9 @@ def _resolve_audio_stream(audio_streams: list, audio_language: Optional[str]) ->
 def _resolve_subtitle_stream(subtitle_streams: list, subtitle_language: Optional[str]) -> Optional[dict]:
     """Picks which subtitle stream to use, if any. When no preference is set
     (or a requested language/index isn't available on this item), prefers
-    whichever track the file itself flags as default, then an English track,
-    then just the first one available.
-
-    Checking IsDefault first matters: many releases ship a "signs & songs"
-    or "forced" track tagged with the same language as the real full
-    dialogue track, just to caption on-screen text. If English were checked
-    first, that partial track could win over the actual default simply by
-    appearing earlier in the stream list - leaving viewers with burned-in
-    subtitles that only appear during a handful of scenes.
+    whichever track the file itself flags as default, then an English track
+    (see _pick_preferred for how ties/forced tracks are handled), then just
+    the first one available.
     """
     if not subtitle_streams or subtitle_language == NO_SUBTITLE:
         return None
@@ -223,11 +314,10 @@ def _resolve_subtitle_stream(subtitle_streams: list, subtitle_language: Optional
     if match:
         return match
     default = next((s for s in subtitle_streams if s.get("IsDefault")), None)
-    english = next(
-        (s for s in subtitle_streams if (s.get("Language") or "").lower() in ("eng", "en", "english")),
-        None,
-    )
-    return default or english or subtitle_streams[0]
+    if default:
+        return default
+    english_candidates = [s for s in subtitle_streams if _language_matches(s.get("Language"), "eng")]
+    return _pick_preferred(english_candidates) or subtitle_streams[0]
 
 
 async def get_jellyfin_stream_url(
@@ -243,8 +333,8 @@ async def get_jellyfin_stream_url(
     subtitle track into the video frames, based on the requested languages.
 
     `audio_language`/`subtitle_language` are language codes (e.g. "eng"); pass
-    None for either to auto-select (default track / English-preferring logic
-    as before). Pass `subtitle_language=NO_SUBTITLE` to explicitly disable
+    None for either to auto-select (see NO_SUBTITLE above for the fallback
+    order). Pass `subtitle_language=NO_SUBTITLE` to explicitly disable
     subtitles regardless of what's available.
 
     Returns (stream_url, media_source_id, resolved_audio_index,
@@ -417,7 +507,8 @@ async def report_capabilities(client: httpx.AsyncClient):
     url = f"{JELLYFIN_URL}/Sessions/Capabilities/Full"
     
     # The C# backend expects specific Enum values for SupportedCommands.
-    # Pause, Unpause, Stop, and Seek are all handled by the "PlayState" command.
+    # Pause, Unpause, and Stop all arrive as a "PlayState" message (see the
+    # msg_type == "playstate" branch below) - Seek is not currently handled.
     payload = {
         "PlayableMediaTypes": ["Video", "Audio"],
         "SupportedCommands": [
@@ -557,10 +648,19 @@ async def jellyfin_websocket_listener():
                                     # item it was picked on - stream indices aren't stable
                                     # across items, so carrying the preference forward can
                                     # coincidentally match an unrelated track on the new item
-                                    # instead of falling back to English/default. Reset to
-                                    # auto whenever a genuinely new item starts.
-                                    preferred_audio_language = None
-                                    preferred_subtitle_language = None
+                                    # instead of falling back to the configured default. Reset
+                                    # to the configured default whenever a genuinely new item
+                                    # starts.
+                                    if await is_anime_item(client, current_item_id):
+                                        preferred_audio_language = ANIME_AUDIO_LANGUAGE
+                                        preferred_subtitle_language = ANIME_SUBTITLE_LANGUAGE
+                                        logger.info(
+                                            f"Item is tagged anime - applying anime defaults "
+                                            f"(audio={ANIME_AUDIO_LANGUAGE!r}, subtitle={ANIME_SUBTITLE_LANGUAGE!r})."
+                                        )
+                                    else:
+                                        preferred_audio_language = DEFAULT_AUDIO_LANGUAGE
+                                        preferred_subtitle_language = DEFAULT_SUBTITLE_LANGUAGE
                                 logger.info(f"Play command received for Item ID: {current_item_id}")
                                 (active_stream_url, current_media_source_id, current_audio_stream_index,
                                  current_subtitle_stream_index, current_audio_streams, current_subtitle_streams) = \
