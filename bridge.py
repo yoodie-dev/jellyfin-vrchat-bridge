@@ -18,7 +18,7 @@ load_dotenv()  # Load environment variables from .env file if present
 
 # --- CONFIGURATION ---
 # Read from environment variables, with fallback defaults
-JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://192.168.1.100:8096")
+JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://jellyfin:8096")
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", 8000))
 DEVICE_ID = os.environ.get("DEVICE_ID", "vrchat-hls-bridge")
 DEVICE_NAME = os.environ.get("DEVICE_NAME", "VRChat Stream Target")
@@ -489,7 +489,8 @@ async def jellyfin_websocket_listener():
     """Authenticates as a user, reports capabilities, and listens for Cast commands."""
     global current_item_id, current_media_source_id, active_stream_url, playback_started_at, paused_at, total_paused_seconds
     global current_audio_stream_index, current_subtitle_stream_index, current_audio_streams, current_subtitle_streams
-    
+    global preferred_audio_language, preferred_subtitle_language
+
     async with httpx.AsyncClient() as client:
         # 1. Login as the specific user
         logger.info(f"Logging in as {JELLYFIN_USERNAME}...")
@@ -547,8 +548,19 @@ async def jellyfin_websocket_listener():
                                     get_elapsed_playback_seconds()
                                 )
 
+                            previous_item_id = current_item_id
                             current_item_id = data.get("Data", {}).get("ItemIds", [None])[0]
                             if current_item_id:
+                                if current_item_id != previous_item_id:
+                                    # A manually-selected track (especially an index-based
+                                    # one, see _serialize_stream) is only meaningful for the
+                                    # item it was picked on - stream indices aren't stable
+                                    # across items, so carrying the preference forward can
+                                    # coincidentally match an unrelated track on the new item
+                                    # instead of falling back to English/default. Reset to
+                                    # auto whenever a genuinely new item starts.
+                                    preferred_audio_language = None
+                                    preferred_subtitle_language = None
                                 logger.info(f"Play command received for Item ID: {current_item_id}")
                                 (active_stream_url, current_media_source_id, current_audio_stream_index,
                                  current_subtitle_stream_index, current_audio_streams, current_subtitle_streams) = \

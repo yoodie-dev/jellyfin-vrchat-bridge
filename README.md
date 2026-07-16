@@ -1,6 +1,93 @@
 # Jellyfin to VRChat HLS Bridge
 
-A lightweight Python FastAPI application for streaming Jellyfin content into VRChat and other social VR platforms. Shows up as a player to cast to in Jellyfin, requests a 720p H.264 AAC transcode with burned in subtitles, and has a web UI for selecting audio and subtitle tracks.
+A lightweight Python FastAPI application for streaming Jellyfin content into VRChat and other social VR platforms. Shows up as a player to cast to in Jellyfin, requests a 720p H.264 AAC transcode with burned in subtitles, proxies the stream, and has a web UI for selecting audio and subtitle tracks.
+
+## Setup
+
+### Docker Compose (Recommended)
+
+```yaml
+services:
+  jellyfin-vrchat-bridge:
+    image: ghcr.io/yoodie-dev/jellyfin-vrchat-bridge:latest
+    container_name: jellyfin-vrchat-bridge
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      JELLYFIN_URL: "http://jellyfin:8096"
+      JELLYFIN_USERNAME: "your-jellyfin-username"
+      JELLYFIN_PASSWORD: "your-jellyfin-password"
+```
+
+Update `JELLYFIN_URL`, `JELLYFIN_USERNAME`, and `JELLYFIN_PASSWORD` for the user's Jellyfin server, then run:
+
+```sh
+docker compose up -d
+```
+
+The web UI (for selecting audio/subtitle tracks) will be available at `http://<host>:8000`.
+
+### Local Python
+
+Requires Python 3.12+.
+
+1. Clone the repo and install dependencies:
+
+   ```sh
+   git clone https://github.com/yoodie-dev/jellyfin-vrchat-bridge.git
+   cd jellyfin-vrchat-bridge
+   pip install fastapi uvicorn websockets httpx python-dotenv
+   ```
+
+2. Create a `.env` file in the project root with at least the user's Jellyfin connection details (any other variables from the table below can be overridden here too):
+
+   ```env
+   JELLYFIN_URL=http://192.168.1.100:8096
+   JELLYFIN_USERNAME=your-jellyfin-username
+   JELLYFIN_PASSWORD=your-jellyfin-password
+   ```
+
+3. Run the bridge:
+
+   ```sh
+   python bridge.py
+   ```
+
+The web UI will be available at `http://localhost:8000` (or whatever `BRIDGE_PORT` is set to).
+
+> [!WARNING]
+> Both setup methods above only expose the bridge on the local network. Making it reachable from VRChat over the internet (e.g. via a reverse proxy, port forwarding, or a tunnel like Tailscale/Cloudflare Tunnel) is left up to the user to configure, and the user is responsible for securing it appropriately if they do.
+
+## Usage
+
+1. In the Jellyfin app, start playing something and cast it to the bridge - it shows up in the Cast/Play On device list as whatever `DEVICE_NAME` is set to (`VRChat Stream Target` by default).
+2. In VRChat, open a world's video player (e.g. right-click the screen and choose to enter a URL, depending on the player) and enter:
+
+   ```
+   http://<bridge-host>:<port>/stream.m3u8
+   ```
+
+   Using the Docker Compose setup above with default settings, that's `http://<bridge-host>:8000/stream.m3u8`, where `<bridge-host>` is the IP/hostname of the machine running the container. If the bridge is running behind a reverse proxy the port is not needed.
+3. Use the bridge's web UI at `http://<bridge-host>:8000` to change audio/subtitle tracks while it's playing. If a change is made, stop and start the video in VRChat.
+
+Note that `/stream.m3u8` only returns a valid playlist once something is actively being cast from Jellyfin - if VRChat's player fails to load the URL, make sure step 1 has been done first. If the VRChat video player uses a toggle to switch between video and stream content, it may need to be in the stream position. Some worlds with older versions of AVPro/Unity player will fail to render the video and you will only get a black screen, try another world if this is the case.
+
+Play/Pause should be done through the VRChat video player so VRChat can handle keeping all players in sync with the content. When switching to a new video the player will need to be stopped and started to get the new playlist file.
+
+## Environment Variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `JELLYFIN_URL` | Base URL of the user's Jellyfin server (Required) | `http://jellyfin:8096` |
+| `JELLYFIN_USERNAME` | Username the bridge logs in as (Required) | `user` |
+| `JELLYFIN_PASSWORD` | Password for the above account (Required) | `password` |
+| `BRIDGE_PORT` | Port the bridge's web server listens on | `8000` |
+| `DEVICE_ID` | Device ID reported to Jellyfin (identifies this bridge instance) | `vrchat-hls-bridge` |
+| `DEVICE_NAME` | Device name shown in Jellyfin's Cast menu | `VRChat Stream Target` |
+| `CLIENT_NAME` | Client name reported to Jellyfin | `VRChat HLS Bridge` |
+| `BRIDGE_LOG_LEVEL` | Log level for the bridge's own logger | `INFO` |
+| `OTHER_LOG_LEVEL` | Log level for third-party library loggers (`httpx`, `websockets`) | `WARNING` |
 
 ## AI Disclaimer
 
