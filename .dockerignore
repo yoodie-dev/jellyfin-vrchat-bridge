@@ -3,6 +3,9 @@ __pycache__/
 *.pyo
 *.pyd
 .git
+.gitignore
 .env
 .venv/
 venv/
+LICENSE
+README.md
