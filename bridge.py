@@ -854,6 +854,32 @@ async def index():
 
 # --- FASTAPI PROXY ENDPOINTS ---
 
+def _is_allowed_upstream(url: str) -> bool:
+    """True if `url` points at the configured Jellyfin server. proxy_segment's
+    `url` query param is entirely client-controlled, and every fetch made
+    through it attaches JELLYFIN_HEADERS (including the live session token) -
+    without this check, a caller could point it at an arbitrary host and turn
+    the bridge into an open SSRF proxy that also hands its Jellyfin token to
+    wherever they specify.
+    """
+    # Malformed/adversarial input (e.g. a bogus port) makes urlsplit's `.port`
+    # raise ValueError - since this function is a security gate, any URL we
+    # can't cleanly parse must be rejected rather than propagate as a crash.
+    try:
+        target = urllib.parse.urlsplit(url)
+        allowed = urllib.parse.urlsplit(JELLYFIN_URL)
+        default_ports = {"http": 80, "https": 443}
+        target_port = target.port or default_ports.get(target.scheme)
+        allowed_port = allowed.port or default_ports.get(allowed.scheme)
+    except ValueError:
+        return False
+    return (
+        target.scheme == allowed.scheme
+        and (target.hostname or "").lower() == (allowed.hostname or "").lower()
+        and target_port == allowed_port
+    )
+
+
 @app.get("/stream.m3u8")
 async def proxy_playlist(request: Request):
     """Fetches the real m3u8 playlist from Jellyfin, rewrites the internal
@@ -875,7 +901,11 @@ async def proxy_playlist(request: Request):
 @app.get("/segment/{filename}")
 async def proxy_segment(request: Request, url: str = Query(...), filename: str = ""):
     """Middleman proxy that handles playlists and tricks players with fake file extensions."""
-    
+
+    if not _is_allowed_upstream(url):
+        logger.warning(f"Rejected /segment request for disallowed upstream URL: {url}")
+        return Response("Invalid segment URL.", status_code=400)
+
     # 1. Pause logic
     if not stream_playing_event.is_set():
         logger.info("Player requested chunk, but server is paused. Holding request open...")
