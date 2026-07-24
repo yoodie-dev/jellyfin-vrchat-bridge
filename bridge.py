@@ -854,6 +854,21 @@ async def index():
 
 # --- FASTAPI PROXY ENDPOINTS ---
 
+# httpx's default timeout (5s, covering connect/read/write/pool) is too
+# aggressive for playlist/segment fetches: these proxy Jellyfin's *live*
+# transcode, and it can legitimately take longer than 5s to produce the next
+# segment under load (long sessions, complex scenes, disk contention). A read
+# timeout that short turns a transient transcoder stall into a hard failure
+# for whatever request was in flight - e.g. a dropped audio/video segment
+# with no obvious cause, since the resulting exception wasn't being retried
+# or handled any differently from a real upstream outage.
+UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+
+# One retry absorbs a single slow segment without giving up outright; a
+# second consecutive timeout is treated as a genuine upstream failure.
+SEGMENT_FETCH_RETRIES = 1
+
+
 def _is_allowed_upstream(url: str) -> bool:
     """True if `url` points at the configured Jellyfin server. proxy_segment's
     `url` query param is entirely client-controlled, and every fetch made
@@ -892,7 +907,7 @@ async def proxy_playlist(request: Request):
     if not active_stream_url:
         return Response("No active stream being casted.", status_code=404)
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
         res = await client.get(active_stream_url, headers=JELLYFIN_HEADERS)
         rewritten_content = build_playlist(res.text, active_stream_url, base_url)
         return Response(content=rewritten_content, media_type="application/x-mpegURL")
@@ -922,17 +937,30 @@ async def proxy_segment(request: Request, url: str = Query(...), filename: str =
     is_playlist = parsed_path.endswith(".m3u8")
 
     if is_playlist:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             res = await client.get(url, headers=JELLYFIN_HEADERS)
             base_url = str(request.base_url).rstrip("/")
             rewritten_content = build_playlist(res.text, url, base_url)
             return Response(content=rewritten_content, media_type="application/x-mpegURL")
 
-    # 3. If it's a video chunk (.ts), proxy it ALONG WITH its headers
-    client = httpx.AsyncClient()
-    req = client.build_request("GET", url, headers=JELLYFIN_HEADERS)
-    res = await client.send(req, stream=True)
-    
+    # 3. If it's a video chunk (.ts), proxy it ALONG WITH its headers.
+    # A single slow segment (transcoder briefly stalled) gets one retry
+    # before we give up and report a real upstream failure - see
+    # UPSTREAM_TIMEOUT/SEGMENT_FETCH_RETRIES above for why.
+    client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT)
+    res = None
+    for attempt in range(SEGMENT_FETCH_RETRIES + 1):
+        try:
+            req = client.build_request("GET", url, headers=JELLYFIN_HEADERS)
+            res = await client.send(req, stream=True)
+            break
+        except httpx.TimeoutException:
+            if attempt == SEGMENT_FETCH_RETRIES:
+                await client.aclose()
+                logger.error(f"Segment fetch timed out after retrying, giving up: {url}")
+                return Response("Upstream segment timed out.", status_code=504)
+            logger.warning(f"Segment fetch timed out, retrying once: {url}")
+
     # Carefully forward headers that dictate file size and ranges
     forward_headers = {}
     for header_name in ["content-length", "content-type", "accept-ranges"]:
