@@ -123,6 +123,25 @@ def get_elapsed_playback_seconds() -> float:
     return max(0.0, elapsed)
 
 
+# Query params Jellyfin uses to embed its own auth token directly in HLS
+# URLs (it has to - native HLS players fetch segment URLs directly and can't
+# attach a custom auth header per-segment). The bridge already authenticates
+# every proxied fetch itself via JELLYFIN_HEADERS, so this embedded copy is
+# redundant for us - and left in place, it would hand our Jellyfin session
+# token to every VRChat client that reads the playlist. Stripped in
+# build_playlist before a URL is ever exposed to a client.
+_AUTH_QUERY_PARAMS = {"apikey", "api_key"}
+
+
+def _strip_auth_query_params(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    kept_params = [
+        (key, value) for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in _AUTH_QUERY_PARAMS
+    ]
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(kept_params)))
+
+
 def build_playlist(playlist_content: str, source_url: str, base_url: str) -> str:
     """Rewrites an HLS playlist's segment URLs to point back through this
     bridge. VRChat's own video player handles playback sync/late-join
@@ -133,6 +152,7 @@ def build_playlist(playlist_content: str, source_url: str, base_url: str) -> str
     for line in playlist_content.splitlines():
         if not line.startswith("#") and line.strip():
             full_url = urllib.parse.urljoin(source_url, line.strip())
+            full_url = _strip_auth_query_params(full_url)
             safe_url = urllib.parse.quote(full_url, safe='')
             out_lines.append(f"{base_url}/segment/video.ts?url={safe_url}")
         else:
