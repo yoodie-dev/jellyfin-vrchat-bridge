@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -72,6 +73,15 @@ logging.basicConfig(level=getattr(logging, BRIDGE_LOG_LEVEL))
 logger = logging.getLogger("JellyfinVRChatBridge")
 logging.getLogger("httpx").setLevel(getattr(logging, OTHER_LOG_LEVEL))  # Silence httpx debug logs unless requested
 logging.getLogger("websockets").setLevel(getattr(logging, OTHER_LOG_LEVEL))  # Silence websockets debug logs unless requested
+
+# uvicorn.run() (see the bottom of this file) applies its own logging config
+# on startup, which would stomp on a setLevel() call made here directly - so
+# instead we patch a copy of uvicorn's own config and hand it back via the
+# log_config= kwarg. This is what emits the per-request "GET /segment/...
+# 200 OK" access log line, hardcoded to INFO - extremely noisy (one per HLS
+# segment) and otherwise indistinguishable from an actual problem at INFO.
+UVICORN_LOG_CONFIG = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+UVICORN_LOG_CONFIG["loggers"]["uvicorn.access"]["level"] = OTHER_LOG_LEVEL
 
 app = FastAPI()
 
@@ -997,6 +1007,9 @@ async def startup_event():
     asyncio.create_task(jellyfin_websocket_listener())
 
 if __name__ == "__main__":
-    # proxy_headers=True tells Uvicorn to respect headers like X-Forwarded-Proto 
+    # proxy_headers=True tells Uvicorn to respect headers like X-Forwarded-Proto
     # passed down from Nginx/Traefik/Cloudflare for handling HTTPS properly.
-    uvicorn.run(app, host="0.0.0.0", port=BRIDGE_PORT, proxy_headers=True, forwarded_allow_ips="*")
+    uvicorn.run(
+        app, host="0.0.0.0", port=BRIDGE_PORT, proxy_headers=True, forwarded_allow_ips="*",
+        log_config=UVICORN_LOG_CONFIG,
+    )
