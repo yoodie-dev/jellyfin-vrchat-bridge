@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -73,6 +74,15 @@ logger = logging.getLogger("JellyfinVRChatBridge")
 logging.getLogger("httpx").setLevel(getattr(logging, OTHER_LOG_LEVEL))  # Silence httpx debug logs unless requested
 logging.getLogger("websockets").setLevel(getattr(logging, OTHER_LOG_LEVEL))  # Silence websockets debug logs unless requested
 
+# uvicorn.run() (see the bottom of this file) applies its own logging config
+# on startup, which would stomp on a setLevel() call made here directly - so
+# instead we patch a copy of uvicorn's own config and hand it back via the
+# log_config= kwarg. This is what emits the per-request "GET /segment/...
+# 200 OK" access log line, hardcoded to INFO - extremely noisy (one per HLS
+# segment) and otherwise indistinguishable from an actual problem at INFO.
+UVICORN_LOG_CONFIG = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+UVICORN_LOG_CONFIG["loggers"]["uvicorn.access"]["level"] = OTHER_LOG_LEVEL
+
 app = FastAPI()
 
 # The user token gets added to this dict once login succeeds - see
@@ -123,6 +133,25 @@ def get_elapsed_playback_seconds() -> float:
     return max(0.0, elapsed)
 
 
+# Query params Jellyfin uses to embed its own auth token directly in HLS
+# URLs (it has to - native HLS players fetch segment URLs directly and can't
+# attach a custom auth header per-segment). The bridge already authenticates
+# every proxied fetch itself via JELLYFIN_HEADERS, so this embedded copy is
+# redundant for us - and left in place, it would hand our Jellyfin session
+# token to every VRChat client that reads the playlist. Stripped in
+# build_playlist before a URL is ever exposed to a client.
+_AUTH_QUERY_PARAMS = {"apikey", "api_key"}
+
+
+def _strip_auth_query_params(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    kept_params = [
+        (key, value) for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if key.lower() not in _AUTH_QUERY_PARAMS
+    ]
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(kept_params)))
+
+
 def build_playlist(playlist_content: str, source_url: str, base_url: str) -> str:
     """Rewrites an HLS playlist's segment URLs to point back through this
     bridge. VRChat's own video player handles playback sync/late-join
@@ -133,6 +162,7 @@ def build_playlist(playlist_content: str, source_url: str, base_url: str) -> str
     for line in playlist_content.splitlines():
         if not line.startswith("#") and line.strip():
             full_url = urllib.parse.urljoin(source_url, line.strip())
+            full_url = _strip_auth_query_params(full_url)
             safe_url = urllib.parse.quote(full_url, safe='')
             out_lines.append(f"{base_url}/segment/video.ts?url={safe_url}")
         else:
@@ -834,6 +864,47 @@ async def index():
 
 # --- FASTAPI PROXY ENDPOINTS ---
 
+# httpx's default timeout (5s, covering connect/read/write/pool) is too
+# aggressive for playlist/segment fetches: these proxy Jellyfin's *live*
+# transcode, and it can legitimately take longer than 5s to produce the next
+# segment under load (long sessions, complex scenes, disk contention). A read
+# timeout that short turns a transient transcoder stall into a hard failure
+# for whatever request was in flight - e.g. a dropped audio/video segment
+# with no obvious cause, since the resulting exception wasn't being retried
+# or handled any differently from a real upstream outage.
+UPSTREAM_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=10.0, pool=10.0)
+
+# One retry absorbs a single slow segment without giving up outright; a
+# second consecutive timeout is treated as a genuine upstream failure.
+SEGMENT_FETCH_RETRIES = 1
+
+
+def _is_allowed_upstream(url: str) -> bool:
+    """True if `url` points at the configured Jellyfin server. proxy_segment's
+    `url` query param is entirely client-controlled, and every fetch made
+    through it attaches JELLYFIN_HEADERS (including the live session token) -
+    without this check, a caller could point it at an arbitrary host and turn
+    the bridge into an open SSRF proxy that also hands its Jellyfin token to
+    wherever they specify.
+    """
+    # Malformed/adversarial input (e.g. a bogus port) makes urlsplit's `.port`
+    # raise ValueError - since this function is a security gate, any URL we
+    # can't cleanly parse must be rejected rather than propagate as a crash.
+    try:
+        target = urllib.parse.urlsplit(url)
+        allowed = urllib.parse.urlsplit(JELLYFIN_URL)
+        default_ports = {"http": 80, "https": 443}
+        target_port = target.port or default_ports.get(target.scheme)
+        allowed_port = allowed.port or default_ports.get(allowed.scheme)
+    except ValueError:
+        return False
+    return (
+        target.scheme == allowed.scheme
+        and (target.hostname or "").lower() == (allowed.hostname or "").lower()
+        and target_port == allowed_port
+    )
+
+
 @app.get("/stream.m3u8")
 async def proxy_playlist(request: Request):
     """Fetches the real m3u8 playlist from Jellyfin, rewrites the internal
@@ -846,7 +917,7 @@ async def proxy_playlist(request: Request):
     if not active_stream_url:
         return Response("No active stream being casted.", status_code=404)
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
         res = await client.get(active_stream_url, headers=JELLYFIN_HEADERS)
         rewritten_content = build_playlist(res.text, active_stream_url, base_url)
         return Response(content=rewritten_content, media_type="application/x-mpegURL")
@@ -855,7 +926,11 @@ async def proxy_playlist(request: Request):
 @app.get("/segment/{filename}")
 async def proxy_segment(request: Request, url: str = Query(...), filename: str = ""):
     """Middleman proxy that handles playlists and tricks players with fake file extensions."""
-    
+
+    if not _is_allowed_upstream(url):
+        logger.warning(f"Rejected /segment request for disallowed upstream URL: {url}")
+        return Response("Invalid segment URL.", status_code=400)
+
     # 1. Pause logic
     if not stream_playing_event.is_set():
         logger.info("Player requested chunk, but server is paused. Holding request open...")
@@ -872,17 +947,30 @@ async def proxy_segment(request: Request, url: str = Query(...), filename: str =
     is_playlist = parsed_path.endswith(".m3u8")
 
     if is_playlist:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             res = await client.get(url, headers=JELLYFIN_HEADERS)
             base_url = str(request.base_url).rstrip("/")
             rewritten_content = build_playlist(res.text, url, base_url)
             return Response(content=rewritten_content, media_type="application/x-mpegURL")
 
-    # 3. If it's a video chunk (.ts), proxy it ALONG WITH its headers
-    client = httpx.AsyncClient()
-    req = client.build_request("GET", url, headers=JELLYFIN_HEADERS)
-    res = await client.send(req, stream=True)
-    
+    # 3. If it's a video chunk (.ts), proxy it ALONG WITH its headers.
+    # A single slow segment (transcoder briefly stalled) gets one retry
+    # before we give up and report a real upstream failure - see
+    # UPSTREAM_TIMEOUT/SEGMENT_FETCH_RETRIES above for why.
+    client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT)
+    res = None
+    for attempt in range(SEGMENT_FETCH_RETRIES + 1):
+        try:
+            req = client.build_request("GET", url, headers=JELLYFIN_HEADERS)
+            res = await client.send(req, stream=True)
+            break
+        except httpx.TimeoutException:
+            if attempt == SEGMENT_FETCH_RETRIES:
+                await client.aclose()
+                logger.error(f"Segment fetch timed out after retrying, giving up: {url}")
+                return Response("Upstream segment timed out.", status_code=504)
+            logger.warning(f"Segment fetch timed out, retrying once: {url}")
+
     # Carefully forward headers that dictate file size and ranges
     forward_headers = {}
     for header_name in ["content-length", "content-type", "accept-ranges"]:
@@ -919,6 +1007,9 @@ async def startup_event():
     asyncio.create_task(jellyfin_websocket_listener())
 
 if __name__ == "__main__":
-    # proxy_headers=True tells Uvicorn to respect headers like X-Forwarded-Proto 
+    # proxy_headers=True tells Uvicorn to respect headers like X-Forwarded-Proto
     # passed down from Nginx/Traefik/Cloudflare for handling HTTPS properly.
-    uvicorn.run(app, host="0.0.0.0", port=BRIDGE_PORT, proxy_headers=True, forwarded_allow_ips="*")
+    uvicorn.run(
+        app, host="0.0.0.0", port=BRIDGE_PORT, proxy_headers=True, forwarded_allow_ips="*",
+        log_config=UVICORN_LOG_CONFIG,
+    )
