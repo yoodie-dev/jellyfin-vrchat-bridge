@@ -654,14 +654,22 @@ async def jellyfin_websocket_listener():
         # 3. Report our player capabilities using the new user token
         await report_capabilities(client)
         
-        # 4. Connect to the WebSocket
-        ws_url = f"{JELLYFIN_URL.replace('http', 'ws')}/socket?api_key={access_token}&deviceId={DEVICE_ID}"
+        # 4. Connect to the WebSocket. The token goes in the Authorization
+        # header rather than the old ?api_key= query param: that param is one
+        # of the legacy auth carriers Jellyfin 12 disabled by default, so it
+        # now rejects the handshake with a 403. Keeping the token in a header
+        # also keeps it out of Jellyfin's access logs. deviceId stays in the
+        # query string - it only associates the socket with our session.
+        ws_url = f"{JELLYFIN_URL.replace('http', 'ws')}/socket?deviceId={DEVICE_ID}"
         asyncio.create_task(send_heartbeat(client))
-        
+
         while True:
             try:
                 logger.info("Connecting to Jellyfin WebSocket...")
-                async with websockets.connect(ws_url) as ws:
+                async with websockets.connect(
+                    ws_url,
+                    additional_headers={"Authorization": JELLYFIN_HEADERS["Authorization"]},
+                ) as ws:
                     logger.info("WebSocket Connected! App should now be visible in the Cast menu.")
                     
                     async for message in ws:
