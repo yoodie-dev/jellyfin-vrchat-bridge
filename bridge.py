@@ -85,10 +85,27 @@ UVICORN_LOG_CONFIG["loggers"]["uvicorn.access"]["level"] = OTHER_LOG_LEVEL
 
 app = FastAPI()
 
-# The user token gets added to this dict once login succeeds - see
-# jellyfin_websocket_listener, which sets JELLYFIN_HEADERS["X-MediaBrowser-Token"].
+def _media_browser_auth_header(token: Optional[str] = None) -> str:
+    """Builds the standard `Authorization: MediaBrowser ...` header value.
+    Jellyfin 12+ disabled EnableLegacyAuthorization by default, which makes it
+    reject the old X-Emby-Authorization/X-MediaBrowser-Token headers outright
+    (400 Bad Request) - this is the one header format it still accepts.
+    """
+    parts = [
+        f'Client="{CLIENT_NAME}"',
+        f'Device="{DEVICE_NAME}"',
+        f'DeviceId="{DEVICE_ID}"',
+        f'Version="{VERSION}"',
+    ]
+    if token:
+        parts.append(f'Token="{token}"')
+    return "MediaBrowser " + ", ".join(parts)
+
+
+# The user token gets folded into this header once login succeeds - see
+# jellyfin_websocket_listener, which replaces JELLYFIN_HEADERS["Authorization"].
 JELLYFIN_HEADERS = {
-    "X-Emby-Authorization": f'MediaBrowser Client="{CLIENT_NAME}", Device="{DEVICE_NAME}", DeviceId="{DEVICE_ID}", Version="{VERSION}"',
+    "Authorization": _media_browser_auth_header(),
 }
 
 current_item_id = None
@@ -628,7 +645,7 @@ async def jellyfin_websocket_listener():
             logger.info("Authentication successful! Acquired User Token.")
             
             # 2. Inject the acquired token into our global headers
-            JELLYFIN_HEADERS["X-MediaBrowser-Token"] = access_token
+            JELLYFIN_HEADERS["Authorization"] = _media_browser_auth_header(access_token)
             
         except Exception as e:
             logger.error(f"Failed to log in. Check username/password. Error: {e}")
